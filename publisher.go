@@ -2,9 +2,10 @@ package rabbitmq
 
 import (
 	"context"
-	amqp "github.com/rabbitmq/amqp091-go"
-	"log"
+	"fmt"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type Publisher struct {
@@ -17,7 +18,7 @@ func NewPublisher(rmq *RabbitMQ) *Publisher {
 	}
 }
 
-func (p *Publisher) Publish(exc *ExchangeConfig, qc *QueueConfig, routingKey string, msg *Message) error {
+func (p *Publisher) Publish(exc *ExchangeConfig, qc *QueueConfig, routingKey string, msg *Message, publishing amqp.Publishing) error {
 	// Checking if RabbitMQ is enabled
 	if !p.rmq.Enable {
 		return nil
@@ -25,11 +26,18 @@ func (p *Publisher) Publish(exc *ExchangeConfig, qc *QueueConfig, routingKey str
 
 	// Open a channel
 	ch, err := p.rmq.Conn.Channel()
-	failOnError(err, "Failed to open a channel")
-	defer ch.Close()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := ch.Close(); err != nil {
+			fmt.Println("could not close channel.got error:", err)
+		}
+	}()
 
 	// Declare a topic exchange
-	err = ch.ExchangeDeclare(
+	if err := ch.ExchangeDeclare(
 		exc.Name,       // exchange name
 		exc.Type,       // exchange type
 		exc.Durable,    // durable
@@ -37,12 +45,13 @@ func (p *Publisher) Publish(exc *ExchangeConfig, qc *QueueConfig, routingKey str
 		exc.Internal,   // internal
 		exc.NoWait,     // no-wait
 		exc.Args,       // arguments
-	)
-	failOnError(err, "Failed to ExchangeDeclare a queue")
+	); err != nil {
+		return fmt.Errorf("failed to ExchangeDeclare a queue: %w", err)
+	}
 
 	// Declare a queue
 	q, err := ch.QueueDeclare(
-		qc.Name,       // queue name (auto-generated)
+		qc.Name,       // queue name
 		qc.Durable,    // durable
 		qc.AutoDelete, // delete when unused
 		qc.Exclusive,  // exclusive
@@ -50,33 +59,27 @@ func (p *Publisher) Publish(exc *ExchangeConfig, qc *QueueConfig, routingKey str
 		qc.Args,       // arguments
 	)
 
-	failOnError(err, "Failed to QueueDeclare a queue")
+	if err != nil {
+		return fmt.Errorf("failed to ExchangeDeclare a queue: %s %w", qc.Name, err)
+	}
 
 	// Bind the queue to the exchange
-	err = ch.QueueBind(
+	if err := ch.QueueBind(
 		q.Name,     // queue name
 		routingKey, // routing key
 		exc.Name,   // exchange name
 		exc.NoWait,
 		exc.Args,
-	)
-	failOnError(err, "Failed to bind a message")
+	); err != nil {
+		return fmt.Errorf("failed to QueueBind a queue: %s %w", q.Name, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err = ch.PublishWithContext(ctx, exc.Name, routingKey, msg.Mandatory, msg.Immediate, amqp.Publishing{
-		ContentType: msg.ContentType,
-		Body:        msg.Body,
-	})
-	failOnError(err, "Failed to publish a message")
+	if err = ch.PublishWithContext(ctx, exc.Name, routingKey, msg.Mandatory, msg.Immediate, publishing); err != nil {
+		return fmt.Errorf("failed to publish a message: %w", err)
+	}
 
 	return nil
-}
-
-func failOnError(err error, msg string) {
-	if err != nil {
-		log.Printf("%s: %s", msg, err)
-	}
-	return
 }

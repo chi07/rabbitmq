@@ -1,6 +1,10 @@
 package rabbitmq
 
-import "log"
+import (
+	"fmt"
+
+	log "github.com/sirupsen/logrus"
+)
 
 type Subscriber struct {
 	rmq *RabbitMQ
@@ -12,9 +16,9 @@ func NewSubscriber(rmq *RabbitMQ) *Subscriber {
 	}
 }
 
-type MessageHandler func(message []byte)
+type HandleMessageFunc func(message []byte) error
 
-func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *ConsumerConfig, handler MessageHandler) error {
+func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *ConsumerConfig, handleMsgFunc HandleMessageFunc) error {
 	// Checking if RabbitMQ is enabled
 	if !s.rmq.Enable {
 		return nil
@@ -22,12 +26,16 @@ func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *Consume
 
 	// Open a channel
 	ch, err := s.rmq.Conn.Channel()
-	failOnError(err, "Failed to open a channel")
+	defer func() {
+		if err := ch.Close(); err != nil {
+			fmt.Println("could not close channel.got error:", err)
+		}
+	}()
 
 	defer ch.Close()
 
 	// Declare a topic exchange
-	err = ch.ExchangeDeclare(
+	if err = ch.ExchangeDeclare(
 		exc.Name,       // exchange name
 		exc.Type,       // exchange type
 		exc.Durable,    // durable
@@ -35,8 +43,9 @@ func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *Consume
 		exc.Internal,   // internal
 		exc.NoWait,     // no-wait
 		exc.Args,       // arguments
-	)
-	failOnError(err, "Failed to ExchangeDeclare a queue")
+	); err != nil {
+		return fmt.Errorf("failed to ExchangeDeclare a queue: %s got error: %w", exc.Name, err)
+	}
 
 	// Declare a queue
 	q, err := ch.QueueDeclare(
@@ -48,7 +57,9 @@ func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *Consume
 		qc.Args,       // arguments
 	)
 
-	failOnError(err, "Failed to QueueDeclare a queue")
+	if err != nil {
+		return fmt.Errorf("failed to QueueDeclare a queue: %s got error: %w", qc.Name, err)
+	}
 
 	// start consuming messages
 	messages, err := ch.Consume(
@@ -60,14 +71,19 @@ func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *Consume
 		cf.NoWait,    // no-wait
 		cf.Args,      // args
 	)
-	failOnError(err, "Failed to register a consumer")
+
+	if err != nil {
+		return fmt.Errorf("failed to Consume a message on queue: %s got error: %w", q.Name, err)
+	}
 
 	var forever chan struct{}
 
 	go func() {
-		for d := range messages {
-			handler(d.Body)
-			log.Printf("Received a message: %s", d.Body)
+		for msg := range messages {
+			log.Printf("Received a message: %s", msg.Body)
+			if err := handleMsgFunc(msg.Body); err != nil {
+				log.Error("failed to handle message: %s", err)
+			}
 		}
 	}()
 
