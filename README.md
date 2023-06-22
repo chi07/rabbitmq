@@ -1,2 +1,2 @@
-# App Error custom module
-App Error custom module for Golang
+# RabbitMQ custom module
+RabbitMQ custom module for Golang
