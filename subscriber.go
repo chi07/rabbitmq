@@ -1,13 +1,35 @@
 package rabbitmq
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type Subscriber struct {
 	rmq *RabbitMQ
+}
+
+type Retry struct {
+	MaxRetry int
+}
+
+type OnFailedStrategy struct {
+	Retry                   *Retry
+	handleFailedMessageFunc *HandleFailedMessageFunc
+	deadLetterExchange      string
+}
+
+func NewOnFailedStrategy(retry *Retry, handleFailedMessageFunc *HandleFailedMessageFunc, deadLetterExchange string) *OnFailedStrategy {
+	return &OnFailedStrategy{
+		Retry:                   retry,
+		handleFailedMessageFunc: handleFailedMessageFunc,
+		deadLetterExchange:      deadLetterExchange,
+	}
 }
 
 func NewSubscriber(rmq *RabbitMQ) *Subscriber {
@@ -16,9 +38,16 @@ func NewSubscriber(rmq *RabbitMQ) *Subscriber {
 	}
 }
 
-type HandleMessageFunc func(message []byte) error
+type ProcessMessageFunc func(message amqp.Delivery) error
+type HandleFailedMessageFunc func(message amqp.Delivery, err error) error
 
-func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *ConsumerConfig, handleMsgFunc HandleMessageFunc) error {
+func (s *Subscriber) Subscribe(
+	exc *ExchangeConfig,
+	qc *QueueConfig,
+	cf *ConsumerConfig,
+	onFailedStrategy *OnFailedStrategy,
+	processMessageFunc ProcessMessageFunc,
+	handleFailedMessageFunc HandleFailedMessageFunc) error {
 	// Checking if RabbitMQ is enabled
 	if !s.rmq.Enable {
 		return nil
@@ -79,15 +108,91 @@ func (s *Subscriber) Subscribe(exc *ExchangeConfig, qc *QueueConfig, cf *Consume
 	var forever chan struct{}
 
 	go func() {
-		for msg := range messages {
-			log.Printf("Received a message: %s", msg.Body)
-			if err := handleMsgFunc(msg.Body); err != nil {
-				log.Error("failed to handle message: %s", err)
-			}
-		}
+		consumeMessage(messages, ch, onFailedStrategy, processMessageFunc, handleFailedMessageFunc)
 	}()
 
 	log.Printf("[*] Waiting for messages.")
 	<-forever
 	return nil
+}
+
+func consumeMessage(messages <-chan amqp.Delivery, ch *amqp.Channel, onFailedStrategy *OnFailedStrategy, processMessage ProcessMessageFunc, handleFailedMessageFunc HandleFailedMessageFunc) {
+	for message := range messages {
+		err := processMessage(message)
+		if err != nil {
+			// Handle the error and retry
+			retryCount := 0
+			maxRetries := 3
+
+			for retryCount < maxRetries {
+				retryCount++
+				time.Sleep(time.Duration(retryCount) * time.Second)
+
+				err = processMessage(message)
+				if err == nil {
+					// Message processed successfully
+					message.Ack(false)
+					break
+				}
+			}
+
+			if err != nil {
+				// Failed to process the message after retries
+				err = handleFailedMessageFunc(message, err)
+				if err != nil {
+					log.Printf("Failed to handle failed message: %s", err.Error())
+					continue
+				}
+				if onFailedStrategy != nil && onFailedStrategy.deadLetterExchange != "" {
+					moveToDeadLetterQueue(message, ch, onFailedStrategy.deadLetterExchange)
+				}
+				continue
+			}
+		}
+
+		// Message processed successfully
+		message.Ack(false)
+	}
+}
+
+func moveToDeadLetterQueue(message amqp.Delivery, ch *amqp.Channel, dlqName string) {
+	// Re-declare the Dead Letter Queue
+	_, err := ch.QueueDeclare(
+		dlqName, // dead letter queue name
+		true,    // durable
+		false,   // delete when unused
+		false,   // exclusive
+		false,   // no-wait
+		nil,     // arguments
+	)
+	if err != nil {
+		log.Printf("Failed to declare Dead Letter Queue: %s", err.Error())
+		return
+	}
+
+	// Create a new headers table for the message
+	headers := make(amqp.Table)
+	headers["x-original-exchange"] = message.Exchange
+	headers["x-original-routing-key"] = message.RoutingKey
+
+	// Publish the message to the Dead Letter Queue with the original headers
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = ch.PublishWithContext(
+		ctx,
+		"",      // exchange
+		dlqName, // routing key
+		false,   // mandatory
+		false,   // immediate
+		amqp.Publishing{
+			Headers: headers,
+			Body:    message.Body,
+		},
+	)
+	if err != nil {
+		log.Printf("Failed to move message to Dead Letter Queue: %s", err.Error())
+		return
+	}
+
+	log.Printf("Message moved to Dead Letter Queue: %s", string(message.Body))
 }
