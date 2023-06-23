@@ -121,18 +121,20 @@ func consumeMessage(messages <-chan amqp.Delivery, ch *amqp.Channel, onFailedStr
 		err := processMessage(message)
 		if err != nil {
 			// Handle the error and retry
-			retryCount := 0
-			maxRetries := 3
+			if onFailedStrategy != nil && onFailedStrategy.Retry != nil && onFailedStrategy.Retry.MaxRetry > 0 {
+				retryCount := 0
+				maxRetries := onFailedStrategy.Retry.MaxRetry
 
-			for retryCount < maxRetries {
-				retryCount++
-				time.Sleep(time.Duration(retryCount) * time.Second)
+				for retryCount < maxRetries {
+					retryCount++
+					time.Sleep(time.Duration(retryCount) * time.Second)
 
-				err = processMessage(message)
-				if err == nil {
-					// Message processed successfully
-					message.Ack(false)
-					break
+					err = processMessage(message)
+					if err == nil {
+						// Message processed successfully
+						message.Ack(false)
+						break
+					}
 				}
 			}
 
@@ -166,7 +168,7 @@ func moveToDeadLetterQueue(message amqp.Delivery, ch *amqp.Channel, dlqName stri
 		nil,     // arguments
 	)
 	if err != nil {
-		log.Printf("Failed to declare Dead Letter Queue: %s", err.Error())
+		log.Printf("Failed to declare DLQ: %s", err.Error())
 		return
 	}
 
@@ -190,9 +192,9 @@ func moveToDeadLetterQueue(message amqp.Delivery, ch *amqp.Channel, dlqName stri
 		},
 	)
 	if err != nil {
-		log.Printf("Failed to move message to Dead Letter Queue: %s", err.Error())
+		log.Printf("Failed to move message %v to Dead Letter Queue: %s got error %s", message, dlqName, err.Error())
 		return
 	}
 
-	log.Printf("Message moved to Dead Letter Queue: %s", string(message.Body))
+	log.Printf("Message %v moved to Dead Letter Queue: %s", message, string(message.Body))
 }
