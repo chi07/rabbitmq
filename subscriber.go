@@ -43,7 +43,7 @@ type HandleFailedMessageFunc func(message amqp.Delivery, err error) error
 
 func (s *Subscriber) Subscribe(
 	exc *ExchangeConfig,
-	qc *QueueConfig,
+	queueName string,
 	cf *ConsumerConfig,
 	onFailedStrategy *OnFailedStrategy,
 	processMessageFunc ProcessMessageFunc,
@@ -78,16 +78,16 @@ func (s *Subscriber) Subscribe(
 
 	// Declare a queue
 	q, err := ch.QueueDeclare(
-		qc.Name,       // queue name (auto-generated)
-		qc.Durable,    // durable
-		qc.AutoDelete, // delete when unused
-		qc.Exclusive,  // exclusive
-		qc.NoWait,     // no-wait
-		qc.Args,       // arguments
+		queueName,      // queue name (auto-generated)
+		exc.Durable,    // durable
+		exc.AutoDelete, // delete when unused
+		exc.Exclusive,  // exclusive
+		exc.NoWait,     // no-wait
+		exc.Args,       // arguments
 	)
 
 	if err != nil {
-		return fmt.Errorf("failed to QueueDeclare a queue: %s got error: %w", qc.Name, err)
+		return fmt.Errorf("failed to QueueDeclare a queue: %s got error: %w", queueName, err)
 	}
 
 	// start consuming messages

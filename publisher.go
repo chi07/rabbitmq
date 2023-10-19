@@ -18,7 +18,7 @@ func NewPublisher(rmq *RabbitMQ) *Publisher {
 	}
 }
 
-func (p *Publisher) Publish(exc *ExchangeConfig, qc *QueueConfig, routingKey string, msg *Message, publishing amqp.Publishing) error {
+func (p *Publisher) Publish(exc *ExchangeConfig, queueName, routingKey string, msg *Message, publishing amqp.Publishing) error {
 	// Checking if RabbitMQ is enabled
 	if !p.rmq.Enable {
 		return nil
@@ -51,16 +51,16 @@ func (p *Publisher) Publish(exc *ExchangeConfig, qc *QueueConfig, routingKey str
 
 	// Declare a queue
 	q, err := ch.QueueDeclare(
-		qc.Name,       // queue name
-		qc.Durable,    // durable
-		qc.AutoDelete, // delete when unused
-		qc.Exclusive,  // exclusive
-		qc.NoWait,     // no-wait
-		qc.Args,       // arguments
+		queueName,      // queue name
+		exc.Durable,    // durable
+		exc.AutoDelete, // delete when unused
+		exc.Exclusive,  // exclusive
+		exc.NoWait,     // no-wait
+		exc.Args,       // arguments
 	)
 
 	if err != nil {
-		return fmt.Errorf("failed to ExchangeDeclare a queue: %s %w", qc.Name, err)
+		return fmt.Errorf("failed to ExchangeDeclare a queue: %s %w", queueName, err)
 	}
 
 	// Bind the queue to the exchange
