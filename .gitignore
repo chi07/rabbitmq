@@ -21,3 +21,5 @@
 go.work
 coverage.html
 coverage.out
+.DS_Store
+.idea/

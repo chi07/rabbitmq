@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -16,185 +14,125 @@ type Subscriber struct {
 
 type Retry struct {
 	MaxRetry int
+	Delay    time.Duration // thêm: delay giữa các lần retry
 }
 
 type OnFailedStrategy struct {
-	Retry                   *Retry
-	handleFailedMessageFunc *HandleFailedMessageFunc
-	deadLetterExchange      string
+	Retry              *Retry
+	HandleFailed       HandleFailedMessageFunc
+	DeadLetterExchange string
 }
 
-func NewOnFailedStrategy(retry *Retry, handleFailedMessageFunc *HandleFailedMessageFunc, deadLetterExchange string) *OnFailedStrategy {
-	return &OnFailedStrategy{
-		Retry:                   retry,
-		handleFailedMessageFunc: handleFailedMessageFunc,
-		deadLetterExchange:      deadLetterExchange,
-	}
-}
+type ProcessMessageFunc func(amqp.Delivery) error
+type HandleFailedMessageFunc func(amqp.Delivery, error) error
 
 func NewSubscriber(rmq *RabbitMQ) *Subscriber {
-	return &Subscriber{
-		rmq: rmq,
-	}
+	return &Subscriber{rmq: rmq}
 }
 
-type ProcessMessageFunc func(message amqp.Delivery) error
-type HandleFailedMessageFunc func(message amqp.Delivery, err error) error
-
 func (s *Subscriber) Subscribe(
+	ctx context.Context,
 	exc *ExchangeConfig,
 	qc *QueueConfig,
 	cf *ConsumerConfig,
-	onFailedStrategy *OnFailedStrategy,
-	processMessageFunc ProcessMessageFunc,
-	handleFailedMessageFunc HandleFailedMessageFunc) error {
-	// Checking if RabbitMQ is enabled
+	onFailed *OnFailedStrategy,
+	process ProcessMessageFunc,
+) error {
 	if !s.rmq.Enable {
 		return nil
 	}
 
-	// Open a channel
 	ch, err := s.rmq.Conn.Channel()
-	defer func() {
-		if err := ch.Close(); err != nil {
-			fmt.Println("could not close channel.got error:", err)
+	if err != nil {
+		return fmt.Errorf("channel open failed: %w", err)
+	}
+	defer func(ch *amqp.Channel) {
+		errClose := ch.Close()
+		if errClose != nil {
+			fmt.Println("could not close channel.got error:", errClose)
 		}
-	}()
+	}(ch)
 
-	defer ch.Close()
-
-	// Declare a topic exchange
-	if err = ch.ExchangeDeclare(
-		exc.Name,       // exchange name
-		exc.Type,       // exchange type
-		exc.Durable,    // durable
-		exc.AutoDelete, // auto-deleted
-		exc.Internal,   // internal
-		exc.NoWait,     // no-wait
-		exc.Args,       // arguments
-	); err != nil {
-		return fmt.Errorf("failed to ExchangeDeclare a queue: %s got error: %w", exc.Name, err)
+	// declare exchange/queue 1 lần khi subscribe
+	if err = ch.ExchangeDeclare(exc.Name, exc.Type, exc.Durable, exc.AutoDelete, exc.Internal, exc.NoWait, exc.Args); err != nil {
+		return fmt.Errorf("exchange declare failed: %w", err)
 	}
-
-	// Declare a queue
-	q, err := ch.QueueDeclare(
-		qc.Name,       // queue name (auto-generated)
-		qc.Durable,    // durable
-		qc.AutoDelete, // delete when unused
-		qc.Exclusive,  // exclusive
-		qc.NoWait,     // no-wait
-		qc.Args,       // arguments
-	)
-
+	q, err := ch.QueueDeclare(qc.Name, qc.Durable, qc.AutoDelete, qc.Exclusive, qc.NoWait, qc.Args)
 	if err != nil {
-		return fmt.Errorf("failed to QueueDeclare a queue: %s got error: %w", qc.Name, err)
+		return fmt.Errorf("queue declare failed: %w", err)
 	}
 
-	// start consuming messages
-	messages, err := ch.Consume(
-		q.Name,       // queue
-		cf.Name,      // consumer
-		cf.AutoAck,   // auto-ack
-		cf.Exclusive, // exclusive
-		cf.NoLocal,   // no-local
-		cf.NoWait,    // no-wait
-		cf.Args,      // args
-	)
-
+	msgs, err := ch.Consume(q.Name, cf.Name, cf.AutoAck, cf.Exclusive, cf.NoLocal, cf.NoWait, cf.Args)
 	if err != nil {
-		return fmt.Errorf("failed to Consume a message on queue: %s got error: %w", q.Name, err)
+		return fmt.Errorf("consume failed: %w", err)
 	}
 
-	var forever chan struct{}
+	go s.consumeLoop(ctx, msgs, ch, onFailed, process)
 
-	go func() {
-		consumeMessage(messages, ch, onFailedStrategy, processMessageFunc, handleFailedMessageFunc)
-	}()
-
-	log.Printf("[*] Waiting for messages.")
-	<-forever
+	<-ctx.Done() // hủy theo context
 	return nil
 }
 
-func consumeMessage(messages <-chan amqp.Delivery, ch *amqp.Channel, onFailedStrategy *OnFailedStrategy, processMessage ProcessMessageFunc, handleFailedMessageFunc HandleFailedMessageFunc) {
-	for message := range messages {
-		err := processMessage(message)
-		if err != nil {
-			// Handle the error and retry
-			if onFailedStrategy != nil && onFailedStrategy.Retry != nil && onFailedStrategy.Retry.MaxRetry > 0 {
-				retryCount := 0
-				maxRetries := onFailedStrategy.Retry.MaxRetry
-
-				for retryCount < maxRetries {
-					retryCount++
-					time.Sleep(time.Duration(retryCount) * time.Second)
-
-					err = processMessage(message)
-					if err == nil {
-						// Message processed successfully
-						message.Ack(false)
-						break
-					}
-				}
+func (s *Subscriber) consumeLoop(
+	ctx context.Context,
+	msgs <-chan amqp.Delivery,
+	ch *amqp.Channel,
+	onFailed *OnFailedStrategy,
+	process ProcessMessageFunc,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				return
 			}
-
-			if err != nil {
-				// Failed to process the message after retries
-				err = handleFailedMessageFunc(message, err)
-				if err != nil {
-					log.Printf("Failed to handle failed message: %s", err.Error())
-					continue
-				}
-				if onFailedStrategy != nil && onFailedStrategy.deadLetterExchange != "" {
-					moveToDeadLetterQueue(message, ch, onFailedStrategy.deadLetterExchange)
-				}
+			if err := process(msg); err != nil {
+				s.handleFailure(ctx, ch, msg, err, onFailed)
 				continue
 			}
+			msg.Ack(false)
 		}
-
-		// Message processed successfully
-		message.Ack(false)
 	}
 }
 
-func moveToDeadLetterQueue(message amqp.Delivery, ch *amqp.Channel, dlqName string) {
-	// Re-declare the Dead Letter Queue
-	_, err := ch.QueueDeclare(
-		dlqName, // dead letter queue name
-		true,    // durable
-		false,   // delete when unused
-		false,   // exclusive
-		false,   // no-wait
-		nil,     // arguments
-	)
-	if err != nil {
-		log.Printf("Failed to declare DLQ: %s", err.Error())
+func (s *Subscriber) handleFailure(
+	ctx context.Context,
+	ch *amqp.Channel,
+	msg amqp.Delivery,
+	err error,
+	onFailed *OnFailedStrategy,
+) {
+	if onFailed == nil {
+		errNack := msg.Nack(false, false)
+		if errNack != nil {
+			return
+		}
 		return
 	}
 
-	// Create a new headers table for the message
-	headers := make(amqp.Table)
-	headers["x-original-exchange"] = message.Exchange
-	headers["x-original-routing-key"] = message.RoutingKey
-
-	// Publish the message to the Dead Letter Queue with the original headers
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	err = ch.PublishWithContext(
-		ctx,
-		"",      // exchange
-		dlqName, // routing key
-		false,   // mandatory
-		false,   // immediate
-		amqp.Publishing{
-			Headers: headers,
-			Body:    message.Body,
-		},
-	)
-	if err != nil {
-		log.Printf("Failed to move message %v to Dead Letter Queue: %s got error %s", message, dlqName, err.Error())
-		return
+	// Retry logic
+	if onFailed.Retry != nil {
+		for i := 1; i <= onFailed.Retry.MaxRetry; i++ {
+			time.Sleep(onFailed.Retry.Delay)
+			if e := onFailed.HandleFailed(msg, err); e == nil {
+				errAck := msg.Ack(false)
+				if errAck != nil {
+					return
+				}
+				return
+			}
+		}
 	}
 
-	log.Printf("Message %v moved to Dead Letter Queue: %s", message, string(message.Body))
+	// Dead letter
+	if onFailed.DeadLetterExchange != "" {
+		_ = ch.PublishWithContext(ctx, onFailed.DeadLetterExchange, msg.RoutingKey, false, false,
+			amqp.Publishing{Body: msg.Body, Headers: msg.Headers})
+	}
+	errNack := msg.Nack(false, false)
+	if errNack != nil {
+		return
+	}
 }
